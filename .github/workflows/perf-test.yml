@@ -3,7 +3,8 @@ name: Performance Tests
 on:
   schedule:
     # Run daily at 06:00 UTC
-    - cron: "0 6 * * *"
+    # erst mal eine Pause machen 03.08.2026
+    # - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       scale:

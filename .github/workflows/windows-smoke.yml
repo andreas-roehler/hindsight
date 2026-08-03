@@ -8,7 +8,7 @@ name: Windows Smoke Test
 on:
   schedule:
     # 06:00 UTC daily.
-    - cron: "0 6 * * *"
+    # - cron: "0 6 * * *"
   workflow_dispatch:
 
 permissions:
