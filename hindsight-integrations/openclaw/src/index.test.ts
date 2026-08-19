@@ -6,8 +6,6 @@ import {
   formatCurrentTimeForRecall,
   formatMemories,
   prepareRetentionTranscript,
-  countUserTurns,
-  getRetentionTurnIndex,
   sliceLastTurnsByUserBoundary,
   composeRecallQuery,
   truncateRecallQuery,
@@ -323,35 +321,6 @@ describe("formatCurrentTimeForRecall", () => {
 // ---------------------------------------------------------------------------
 // retention helpers
 // ---------------------------------------------------------------------------
-
-describe("countUserTurns", () => {
-  it("counts user messages across a resumed conversation history", () => {
-    expect(
-      countUserTurns([
-        { role: "user", content: "turn 1" },
-        { role: "assistant", content: "reply 1" },
-        { role: "system", content: "meta" },
-        { role: "user", content: "turn 2" },
-        { role: "assistant", content: "reply 2" },
-        { role: "user", content: "turn 3" },
-      ])
-    ).toBe(3);
-  });
-});
-
-describe("getRetentionTurnIndex", () => {
-  it("uses the full conversation turn count for per-turn retention", () => {
-    expect(getRetentionTurnIndex(7, 1)).toBe(7);
-  });
-
-  it("derives a stable window sequence for chunked retention", () => {
-    expect(getRetentionTurnIndex(6, 3)).toBe(2);
-  });
-
-  it("returns null when a chunk boundary has not been reached", () => {
-    expect(getRetentionTurnIndex(5, 3)).toBeNull();
-  });
-});
 
 describe("normalizeRetainTags", () => {
   it("trims, deduplicates, and preserves order for string arrays", () => {
@@ -1667,6 +1636,19 @@ describe("getPluginConfig — enableKnowledgeTools whitelist", () => {
   });
 });
 
+describe("getPluginConfig — preferObservations (#2977)", () => {
+  it("passes preferObservations=true through when set", () => {
+    expect(getPluginConfig(makeApi({ preferObservations: true })).preferObservations).toBe(true);
+  });
+
+  it("defaults to false when not set or set to a non-boolean truthy value", () => {
+    expect(getPluginConfig(makeApi({})).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: false })).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: "true" })).preferObservations).toBe(false);
+    expect(getPluginConfig(makeApi({ preferObservations: 1 })).preferObservations).toBe(false);
+  });
+});
+
 describe("formatHookPerf (#1406)", () => {
   it("emits the hook name, total ms, and field key=value pairs", () => {
     const line = formatHookPerf("before_prompt_build", 4200, {
@@ -1711,6 +1693,21 @@ describe("getPluginConfig — debugPerfTiming flag (#1406)", () => {
     expect(getPluginConfig(makeApi({ debugPerfTiming: false })).debugPerfTiming).toBe(false);
     expect(getPluginConfig(makeApi({ debugPerfTiming: "yes" })).debugPerfTiming).toBe(false);
     expect(getPluginConfig(makeApi({ debugPerfTiming: 1 })).debugPerfTiming).toBe(false);
+  });
+});
+
+describe("getPluginConfig — recall injection position", () => {
+  it("defaults missing or invalid values to user context", () => {
+    expect(getPluginConfig(makeApi({})).recallInjectionPosition).toBe("user");
+    expect(
+      getPluginConfig(makeApi({ recallInjectionPosition: "invalid" })).recallInjectionPosition
+    ).toBe("user");
+  });
+
+  it.each(["prepend", "append", "user"] as const)("preserves an explicit %s value", (position) => {
+    expect(
+      getPluginConfig(makeApi({ recallInjectionPosition: position })).recallInjectionPosition
+    ).toBe(position);
   });
 });
 

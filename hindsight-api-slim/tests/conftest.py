@@ -24,6 +24,33 @@ from dotenv import load_dotenv
 # per worker process. Guarded so slim/no-torch environments still collect.
 try:
     import torch  # noqa: F401  # eager one-time init; see comment above
+
+    # Same class of problem, different torch module. transformers' lazy loader
+    # imports `torch._inductor.test_operators` while resolving classes such as
+    # AutoModelForSequenceClassification / GenerationMixin (exercised by the
+    # cross-encoder / reranker tests). That module registers an `_inductor_test`
+    # TORCH_LIBRARY namespace at module-body level, and under pytest-xdist its
+    # body can execute twice, raising "Only a single TORCH_LIBRARY can be used
+    # to register the namespace _inductor_test". The failure surfaces on
+    # whichever shard runs the reranker tests, masked by transformers as a
+    # misleading "sentence-transformers is required for LocalSTEmbeddings"
+    # ImportError. Seed it once here so the later lazy import is a sys.modules
+    # cache hit and the body never re-executes.
+    import torch._inductor.test_operators  # noqa: F401  # see comment above
+
+    # Seed the rest of the native embedding/reranker stack the same way, and for
+    # the same reason. transformers and safetensors/tokenizers ship PyO3/Rust
+    # and C extensions whose module bodies are not safe to execute twice
+    # (safetensors raises "PyO3 modules ... may only be initialized once per
+    # interpreter process"). When these are first imported lazily from inside a
+    # fixture's event loop / sentence-transformers' thread pools, or re-executed
+    # by transformers' lazy-loader retry path, the second init aborts and — like
+    # the torch cases above — is re-raised as a misleading
+    # "sentence-transformers is required" ImportError on the reranker shard.
+    # Importing the whole chain here (single-threaded, at collection time) puts
+    # every submodule in sys.modules so later imports are cache hits.
+    import transformers  # noqa: F401  # seeds safetensors/tokenizers once
+    import sentence_transformers  # noqa: F401
 except ImportError:
     pass
 
@@ -89,9 +116,30 @@ DEFAULT_PG0_PORT = int(os.environ.get("HINDSIGHT_TEST_PG_PORT", "5556"))
 # no job enabled, so the loop never starts. Tests that exercise it call
 # MaintenanceLoop methods (_run_reconcile / _run_scheduled_mm_refresh /
 # _purge_expired) directly.
+#
+# Every job added to the loop must be switched off here too: one job left on is
+# enough to start the loop for the whole suite, which reintroduces exactly the
+# races the others are disabled to avoid.
 os.environ.setdefault("HINDSIGHT_API_CONSOLIDATION_RECONCILE_INTERVAL_SECONDS", "0")
 os.environ.setdefault("HINDSIGHT_API_MENTAL_MODEL_REFRESH_TICK_SECONDS", "0")
 os.environ.setdefault("HINDSIGHT_API_LLM_TRACE_RETENTION_DAYS", "-1")
+
+# Keep incidental per-bank vector-index DDL out of the suite. The shipped default
+# is 0 — every bank holding rows earns its three indexes — which is right for a
+# deployment whose banks are long-lived and get built once, but wrong here: the
+# suite creates thousands of throwaway banks and writes one or two facts to each,
+# so every one of them would queue a build. Eight xdist workers issuing
+# CREATE INDEX CONCURRENTLY against a single shared memory_units deadlock each
+# other by design (CONCURRENTLY holds ShareUpdateExclusive while it waits out
+# every session whose snapshot could still see the index, including other
+# sessions' index DDL), and that lands on whatever unrelated test happens to be
+# writing at the time.
+#
+# A threshold no test bank can reach means the coverage machinery is inert unless
+# a test asks for it: tests that exercise it patch the threshold themselves (see
+# the low_threshold / default_threshold fixtures in
+# test_repair_bank_vector_indexes.py).
+os.environ.setdefault("HINDSIGHT_API_VECTOR_INDEX_MIN_ROWS", "1000000")
 
 
 # Load environment variables from .env at the start of test session
@@ -100,7 +148,10 @@ def pytest_configure(config):
     # Look for .env in the workspace root (two levels up from tests dir)
     env_file = Path(__file__).parent.parent.parent / ".env"
     if env_file.exists():
-        load_dotenv(env_file)
+        # override=True keeps the workspace .env authoritative for the test
+        # session, matching the precedence hindsight_api used to apply at import
+        # time (removed in #2961 so library imports are side-effect-free).
+        load_dotenv(env_file, override=True)
     else:
         print(f"Warning: {env_file} not found, tests may fail without proper configuration")
 
@@ -136,7 +187,7 @@ def pg0_db_url(db_url, tmp_path_factory, worker_id):
     from hindsight_api.pg0 import parse_pg0_url as _parse_pg0_url
 
     # Determine pg0 instance name/port from db_url (if it's a pg0:// URL) or use defaults
-    if db_url and not _parse_pg0_url(db_url)[0]:
+    if db_url and not _parse_pg0_url(db_url).is_pg0:
         # Plain postgresql:// URL - use it directly but still run migrations
         from hindsight_api.migrations import run_migrations
 
@@ -144,9 +195,9 @@ def pg0_db_url(db_url, tmp_path_factory, worker_id):
         return db_url
 
     if db_url:
-        _, pg0_name, pg0_port = _parse_pg0_url(db_url)
-        pg0_instance_name = pg0_name or DEFAULT_PG0_INSTANCE_NAME
-        pg0_instance_port = pg0_port or DEFAULT_PG0_PORT
+        _parsed = _parse_pg0_url(db_url)
+        pg0_instance_name = _parsed.instance_name or DEFAULT_PG0_INSTANCE_NAME
+        pg0_instance_port = _parsed.port or DEFAULT_PG0_PORT
     else:
         pg0_instance_name = DEFAULT_PG0_INSTANCE_NAME
         pg0_instance_port = DEFAULT_PG0_PORT
@@ -329,8 +380,16 @@ def oracle_db_url(_oracle_admin_dsn):
                 f'CREATE USER {test_user} IDENTIFIED BY "{test_pass}" DEFAULT TABLESPACE USERS QUOTA UNLIMITED ON USERS'
             )
         except oracledb.DatabaseError as e:
-            if hasattr(e.args[0], "code") and e.args[0].code == 1920:
+            code = getattr(e.args[0], "code", None)
+            if code == 1920:
                 # ORA-01920: user name conflicts with another user or role name
+                pass
+            elif code == 1031:
+                # ORA-01031: we are not an admin. CI provisions the user with a
+                # privileged account before pytest runs and then points
+                # ORACLE_TEST_DSN at that same unprivileged user, so this bootstrap
+                # cannot (and need not) create it. Assume it exists — if it does
+                # not, run_migrations below fails with a plain login error.
                 pass
             else:
                 raise
@@ -388,8 +447,8 @@ async def oracle_memory(oracle_db_url, embeddings, cross_encoder, query_analyzer
     try:
         mem = MemoryEngine(
             db_url=oracle_db_url,
-            # Note: config.py loads ../.env with override=True, so these defaults
-            # only apply if no .env file is found. The .env file is authoritative.
+            # Note: conftest loads ../.env with override=True at session start, so
+            # these defaults only apply if no .env file is found. .env is authoritative.
             memory_llm_provider=os.getenv("HINDSIGHT_API_LLM_PROVIDER", "openai"),
             memory_llm_api_key=os.getenv("HINDSIGHT_API_LLM_API_KEY"),
             memory_llm_model=os.getenv("HINDSIGHT_API_LLM_MODEL", "gpt-4o-mini"),
@@ -597,3 +656,18 @@ async def api_client(memory):
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client
+
+
+def enable_audit_default(memory, enabled: bool) -> None:
+    """Set the deployment-wide default for the hierarchical ``audit_log_enabled``.
+
+    ``audit_log_enabled`` resolves through env -> tenant -> bank, and the
+    ConfigResolver snapshots the global layer at construction time. Tests that
+    want "auditing on by default" therefore have to update that snapshot;
+    flipping ``AuditLogger._enabled`` alone only covers actions with no bank in
+    scope. Per-bank overrides are set with ``resolver.update_bank_config``.
+    """
+    from dataclasses import replace
+
+    resolver = memory._config_resolver
+    resolver._global_config = replace(resolver._global_config, audit_log_enabled=enabled)

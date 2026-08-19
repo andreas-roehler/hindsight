@@ -11,8 +11,10 @@ multiple API servers.
 import asyncio
 import json
 import logging
-from dataclasses import asdict, replace
-from typing import TYPE_CHECKING, Any
+from dataclasses import asdict, fields, replace
+from functools import lru_cache
+from types import UnionType
+from typing import TYPE_CHECKING, Any, Union, get_args, get_origin
 
 from hindsight_api.config import (
     RECALL_BUDGET_FUNCTIONS,
@@ -30,6 +32,14 @@ if TYPE_CHECKING:
     from hindsight_api.engine.db.base import DatabaseBackend
 
 logger = logging.getLogger(__name__)
+
+
+class BankConfigPersistenceConflictError(ValueError):
+    """Raised when a validated bank config update can no longer be persisted."""
+
+    def __init__(self, bank_id: str):
+        self.bank_id = bank_id
+        super().__init__(f"Cannot update config for bank '{bank_id}': the bank does not exist")
 
 
 def _validate_retain_strategy_chunking(base_config: HindsightConfig, strategies: Any) -> None:
@@ -128,12 +138,13 @@ class ConfigResolver:
         # Return full config object (dataclass doesn't have __init__ that accepts kwargs, so we update the object)
         # Create a new config instance by copying the global config and updating fields
         resolved_config = HindsightConfig(**config_dict)
-        # Multi-LLM chains are static credential fields (never tenant/bank-overridable),
-        # but asdict() above flattened their member dataclasses into plain dicts. Restore
-        # the original typed objects from the global config so the resolved object stays
-        # well-typed for any consumer that reads them.
+        # Multi-LLM chains and the reranker failover chain are static credential fields
+        # (never tenant/bank-overridable), but asdict() above flattened their member
+        # dataclasses into plain dicts. Restore the original typed objects from the global
+        # config so the resolved object stays well-typed for any consumer that reads them.
         resolved_config = replace(
             resolved_config,
+            reranker_members=self._global_config.reranker_members,
             llm_members=self._global_config.llm_members,
             llm_strategy=self._global_config.llm_strategy,
             retain_llm_members=self._global_config.retain_llm_members,
@@ -286,7 +297,8 @@ class ConfigResolver:
 
                     # Only return active overrides for configurable fields. JSON null is a tombstone
                     # for "Server Default" in the bank-config UI and should not override defaults.
-                    return {k: v for k, v in normalized.items() if k in self._configurable_fields and v is not None}
+                    active = {k: v for k, v in normalized.items() if k in self._configurable_fields and v is not None}
+                    return _coerce_stored_bank_overrides(bank_id, active)
         except Exception as e:
             logger.error(f"Failed to load bank config for {bank_id}: {e}")
 
@@ -326,16 +338,22 @@ class ConfigResolver:
                         k: v for k, v in normalized.items() if k in self._configurable_fields and v is not None
                     }
                     if overrides:
-                        result[row["bank_id"]] = overrides
+                        result[row["bank_id"]] = _coerce_stored_bank_overrides(row["bank_id"], overrides)
         except Exception as e:
             logger.error(f"Failed to bulk-load bank configs: {e}")
         return result
 
-    async def update_bank_config(
-        self, bank_id: str, updates: dict[str, Any], context: RequestContext | None = None
-    ) -> None:
+    async def validate_bank_config_updates(
+        self,
+        bank_id: str,
+        updates: dict[str, Any],
+        context: RequestContext | None = None,
+        *,
+        projected_bank_overrides: dict[str, Any] | None = None,
+        check_permissions: bool = True,
+    ) -> dict[str, Any]:
         """
-        Update bank configuration overrides (with permission checking).
+        Normalize and validate bank configuration overrides.
 
         Args:
             bank_id: Bank identifier
@@ -344,9 +362,16 @@ class ConfigResolver:
                     or Python field format (llm_provider).
                     Only configurable fields are allowed.
             context: Request context for permission checking
+            projected_bank_overrides: Bank overrides to use as the validation
+                base instead of loading the current bank row.
+            check_permissions: Whether client field permissions apply to these
+                updates. Server-owned projected values set this to false.
+
+        Returns:
+            Normalized updates ready to persist.
 
         Raises:
-            ValueError: If attempting to override invalid/disallowed fields
+            ValueError: If attempting to override invalid/disallowed fields.
         """
         # Normalize keys
         normalized_updates = normalize_config_dict(updates)
@@ -378,7 +403,7 @@ class ConfigResolver:
                 )
 
         # PERMISSIONS: Check tenant/bank permissions
-        if self.tenant_extension and context:
+        if check_permissions and self.tenant_extension and context:
             try:
                 allowed_fields = await self.tenant_extension.get_allowed_config_fields(context, bank_id)
                 if allowed_fields is not None:  # None means "allow all"
@@ -388,7 +413,7 @@ class ConfigResolver:
                             f"Not allowed to modify fields: {sorted(disallowed)}. "
                             f"Your permissions allow: {sorted(list(allowed_fields)[:10])}..."
                             if allowed_fields
-                            else "Not allowed to modify fields: {sorted(disallowed)}. "
+                            else f"Not allowed to modify fields: {sorted(disallowed)}. "
                             "Your permissions do not allow any config modifications."
                         )
             except ValueError:
@@ -396,6 +421,11 @@ class ConfigResolver:
             except Exception as e:
                 logger.warning(f"Failed to check permissions for bank {bank_id}: {e}")
                 # Continue without permission check (fail open for backward compatibility)
+
+        # Validate every value against its declared field type before the
+        # field-specific checks below, so a wrong-shaped value is reported as such
+        # instead of tripping a structural validator with a confusing message.
+        _validate_config_value_types(normalized_updates)
 
         # Validate entity_labels structure
         if "entity_labels" in normalized_updates and normalized_updates["entity_labels"] is not None:
@@ -413,6 +443,16 @@ class ConfigResolver:
                 raise ValueError(
                     "Strategy names must not be empty strings. Remove entries with empty names before saving."
                 )
+            # A strategy's overrides are applied with dataclasses.replace() at retain
+            # time, so a wrong-shaped value there wedges the bank exactly as a
+            # top-level one would. Same contract, same door.
+            for strategy_name, strategy_overrides in normalized_updates["retain_strategies"].items():
+                if not isinstance(strategy_overrides, dict):
+                    raise ValueError(f"Invalid retain strategy {strategy_name!r}: must be an object")
+                try:
+                    _validate_config_value_types(normalize_config_dict(strategy_overrides))
+                except ValueError as e:
+                    raise ValueError(f"Invalid retain strategy {strategy_name!r}: {e}") from e
 
         # Validate recall budget fields
         _validate_recall_budget_updates(normalized_updates)
@@ -427,7 +467,11 @@ class ConfigResolver:
         )
         if chunking_fields_updated:
             config_dict = await self._resolve_parent_config_dict(bank_id, context)
-            active_bank_overrides = await self._load_bank_config(bank_id)
+            active_bank_overrides = (
+                await self._load_bank_config(bank_id)
+                if projected_bank_overrides is None
+                else dict(projected_bank_overrides)
+            )
             for key, value in normalized_updates.items():
                 if key not in self._configurable_fields:
                     continue
@@ -443,17 +487,26 @@ class ConfigResolver:
             )
             _validate_retain_strategy_chunking(base_config, base_config.retain_strategies)
 
-        # Persist the override. Banks are created lazily (on first retain), so a
-        # PATCH that precedes any ingestion would otherwise UPDATE zero rows and
-        # silently no-op while returning 200. Ensure the bank row exists first
-        # (this also creates its per-bank vector indexes), then merge defensively:
-        # COALESCE guards against a NULL config column (NULL || jsonb is NULL),
-        # which would drop the override even when a row is updated.
-        from .engine.retain.fact_storage import ensure_bank_exists
+        return normalized_updates
 
+    async def update_bank_config(
+        self, bank_id: str, updates: dict[str, Any], context: RequestContext | None = None
+    ) -> None:
+        """Validate and persist bank configuration overrides for an existing bank.
+
+        Bank creation belongs to ``MemoryEngine``; this raises ``ValueError`` if
+        the bank does not exist rather than silently discarding the overrides.
+        """
+        normalized_updates = await self.validate_bank_config_updates(bank_id, updates, context)
+        await self._persist_bank_config(bank_id, normalized_updates)
+
+    async def _persist_bank_config(self, bank_id: str, normalized_updates: dict[str, Any]) -> None:
+        """Persist already-validated overrides without changing bank lifecycle state."""
+        # Bank lifecycle belongs to MemoryEngine. Callers must create the row
+        # before reaching this persistence step. COALESCE guards against a NULL
+        # config column (NULL || jsonb is NULL), which would drop the override.
         async with self._backend.acquire() as conn:
-            await ensure_bank_exists(conn, bank_id, ops=self._backend.ops)
-            await conn.execute(
+            result = await conn.execute(
                 f"""
                 UPDATE {fq_table("banks")}
                 SET config = COALESCE(config, '{{}}'::jsonb) || $1::jsonb,
@@ -463,6 +516,14 @@ class ConfigResolver:
                 json.dumps(normalized_updates),
                 bank_id,
             )
+
+        # A missing bank row matches zero rows, which would otherwise persist
+        # nothing while reporting success. Fail loudly instead: reaching here
+        # without the row means a caller skipped the engine's provisioning step.
+        # (The Oracle wrapper reshapes rowcount into the same "UPDATE <n>" form.)
+        updated = int(result.split()[-1]) if isinstance(result, str) and result.startswith("UPDATE") else 0
+        if updated == 0:
+            raise BankConfigPersistenceConflictError(bank_id)
 
         logger.info(f"Updated bank config for {bank_id}: {list(normalized_updates.keys())}")
 
@@ -485,6 +546,147 @@ class ConfigResolver:
             )
 
         logger.info(f"Reset bank config for {bank_id} to defaults")
+
+
+# Fields whose accepted input shape is deliberately wider than the dataclass
+# annotation, because a dedicated structural validator normalizes them later.
+_WIDENED_FIELD_TYPES: dict[str, tuple[type, ...]] = {
+    # parse_entity_labels() accepts both the bare list of label groups and the
+    # {"attributes": [...]} envelope, though the field is annotated `list | None`.
+    "entity_labels": (list, dict),
+}
+
+
+def _runtime_types(declared: Any) -> tuple[type, ...]:
+    """Runtime-checkable base classes for a dataclass field annotation.
+
+    Unwraps unions (``str | None``) and generic aliases (``list[str]`` -> ``list``);
+    ``None`` is dropped because callers handle the tombstone separately. Returns an
+    empty tuple for anything not reducible to concrete classes, which the callers
+    read as "no type contract to enforce".
+    """
+    if declared is type(None):
+        return ()
+    origin = get_origin(declared)
+    if origin in (Union, UnionType):
+        return tuple(t for arg in get_args(declared) for t in _runtime_types(arg))
+    if origin is not None:
+        return (origin,) if isinstance(origin, type) else ()
+    return (declared,) if isinstance(declared, type) else ()
+
+
+@lru_cache(maxsize=1)
+def _configurable_field_types() -> dict[str, tuple[type, ...]]:
+    """Map each configurable field to the value types it accepts."""
+    configurable = HindsightConfig.get_configurable_fields()
+    field_types: dict[str, tuple[type, ...]] = {}
+    for field in fields(HindsightConfig):
+        if field.name not in configurable:
+            continue
+        allowed = _WIDENED_FIELD_TYPES.get(field.name) or _runtime_types(field.type)
+        if allowed:
+            field_types[field.name] = allowed
+    return field_types
+
+
+def _value_matches_type(value: Any, allowed: tuple[type, ...]) -> bool:
+    """Whether ``value`` satisfies a field's declared type contract."""
+    if isinstance(value, bool):
+        # bool is an int subclass; it must not slip into a numeric field.
+        return bool in allowed
+    if isinstance(value, int) and float in allowed:
+        # JSON draws no int/float distinction: 1 is a valid ratio.
+        return True
+    return isinstance(value, allowed)
+
+
+# Field types are reported to API clients, so name them the way the JSON payload
+# reads rather than by their Python class.
+_TYPE_DESCRIPTIONS: dict[type, str] = {
+    bool: "a boolean",
+    int: "an integer",
+    float: "a number",
+    str: "a string",
+    list: "a list",
+    dict: "an object",
+}
+
+
+def _describe_types(allowed: tuple[type, ...]) -> str:
+    return " or ".join(dict.fromkeys(_TYPE_DESCRIPTIONS.get(t, t.__name__) for t in allowed))
+
+
+def _validate_config_value_types(updates: dict[str, Any]) -> None:
+    """Reject values whose type contradicts the declared HindsightConfig type.
+
+    Without this, the bank-config API happily stores e.g. a JSON object in
+    ``observations_mission``; the write succeeds and the bank then fails every
+    consolidation with ``expected string or bytes-like object, got 'dict'`` from
+    deep inside prompt assembly (issue #3218). Reject at the door instead, naming
+    the field and the expected type.
+    """
+    field_types = _configurable_field_types()
+    for key, value in updates.items():
+        allowed = field_types.get(key)
+        # None is the "clear this override" tombstone; unknown keys are rejected
+        # elsewhere as non-configurable.
+        if allowed is None or value is None:
+            continue
+        if not _value_matches_type(value, allowed):
+            raise ValueError(f"{key} must be {_describe_types(allowed)}, got {type(value).__name__}")
+
+
+def _coerce_stored_bank_overrides(bank_id: str, overrides: dict[str, Any], where: str = "") -> dict[str, Any]:
+    """Make stored bank overrides safe to consume, tolerating pre-validation shapes.
+
+    ``_validate_config_value_types`` rejects bad types at write time, but banks
+    configured before that landed can still hold e.g. a JSON object in a
+    string-typed field. Every consumer that treats such a value as text blows up
+    identically on every run (``escape_for_prompt`` -> ``re.sub`` ->
+    "expected string or bytes-like object, got 'dict'"), so the bank's
+    consolidation never recovers on its own (issue #3218).
+
+    String fields are JSON-encoded, which preserves the author's intent — the
+    structure still reaches the prompt, as text. Anything else is dropped so the
+    bank falls back to the tenant/global value rather than wedging.
+
+    ``where`` labels the location in warnings; it is set when recursing into a
+    retain strategy, whose overrides reach the same fields via ``apply_strategy``.
+    """
+    field_types = _configurable_field_types()
+    coerced: dict[str, Any] = {}
+    for key, value in overrides.items():
+        allowed = field_types.get(key)
+        # None passes through: the caller has already dropped top-level tombstones,
+        # and inside a retain strategy a null is a deliberate override to None.
+        if allowed is None or value is None or _value_matches_type(value, allowed):
+            coerced[key] = value
+            continue
+        if str in allowed:
+            coerced[key] = json.dumps(value, ensure_ascii=False)
+            logger.warning(
+                f"Bank {bank_id} config field '{key}'{where} holds a {type(value).__name__} but is a string field; "
+                f"using its JSON encoding. Re-save this field as a string to silence this warning."
+            )
+        else:
+            logger.warning(
+                f"Bank {bank_id} config field '{key}'{where} holds a {type(value).__name__} but must be "
+                f"{_describe_types(allowed)}; ignoring the override and falling back to the server default."
+            )
+
+    # Strategy overrides are spliced onto the resolved config by apply_strategy(),
+    # so a bad value nested there wedges the bank just as a top-level one does.
+    strategies = coerced.get("retain_strategies")
+    if isinstance(strategies, dict):
+        coerced["retain_strategies"] = {
+            name: (
+                _coerce_stored_bank_overrides(bank_id, strategy, where=f" in retain strategy {name!r}")
+                if isinstance(strategy, dict)
+                else strategy
+            )
+            for name, strategy in strategies.items()
+        }
+    return coerced
 
 
 _RECALL_BUDGET_FIXED_KEYS = (

@@ -11,7 +11,7 @@ Usage:
     hindsight-embed daemon status          # Check daemon status
 
 Environment variables:
-    HINDSIGHT_API_LLM_API_KEY: Required. API key for LLM provider.
+    HINDSIGHT_API_LLM_API_KEY: Required when the selected LLM provider uses an API key.
     HINDSIGHT_API_LLM_PROVIDER: Optional. LLM provider (default: "openai").
     HINDSIGHT_API_LLM_MODEL: Optional. LLM model (default: provider-specific, resolved by hindsight-api).
     HINDSIGHT_EMBED_API_URL: Optional. Use external API server instead of starting local daemon.
@@ -785,7 +785,8 @@ def do_ui(args, config: dict, logger):
             status_text = Text()
             status_text.append("UI is running\n\n", style="green bold")
             status_text.append("  URL: ", style="dim")
-            status_text.append(f"http://127.0.0.1:{effective_port}\n", style="cyan")
+            # localhost, not a loopback literal: the UI can be bound to ::1 only.
+            status_text.append(f"http://localhost:{effective_port}\n", style="cyan")
             status_text.append("  Logs: ", style="dim")
             status_text.append(f"{paths.ui_log}", style="")
 
@@ -1606,14 +1607,6 @@ def main():
 
         # Forward all other commands to hindsight-cli
         config = get_config()
-
-        # Check for LLM API key (not required for vertexai which uses GCP credentials)
-        llm_provider = config.get("llm_provider", "openai")
-        providers_without_api_key = ("ollama", "vertexai", "llamacpp")
-        if not config["llm_api_key"] and llm_provider not in providers_without_api_key:
-            print("Error: LLM API key is required.", file=sys.stderr)
-            print("Run 'hindsight-embed configure' to set up.", file=sys.stderr)
-            sys.exit(1)
 
         from . import daemon_client
 

@@ -109,6 +109,7 @@ mod tests {
                     metadata: None,
                     timestamp: None,
                     entities: None,
+                    resolve_entities: true,
                     tags: None,
                     observation_scopes: None,
                     strategy: None,
@@ -121,6 +122,7 @@ mod tests {
                     metadata: None,
                     timestamp: None,
                     entities: None,
+                    resolve_entities: true,
                     tags: None,
                     observation_scopes: None,
                     strategy: None,
@@ -128,6 +130,7 @@ mod tests {
                 },
             ],
             document_tags: None,
+            operation_id: None,
         };
         let retain_response = client
             .retain_memories(&bank_id, None, &retain_request)
